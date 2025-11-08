@@ -1,0 +1,32 @@
+
+[submodule "external/glfw"]
+	path = external/glfw
+	url = https://github.com/glfw/glfw.git
+
+[submodule "external/glslang"]
+	path = external/glslang
+	url = https://github.com/KhronosGroup/glslang.git
+
+[submodule "external/json"]
+	path = external/json
+	url = https://github.com/nlohmann/json.git
+
+[submodule "external/mimalloc"]
+	path = external/mimalloc
+	url = https://github.com/microsoft/mimalloc.git
+
+[submodule "external/SPIRV-Headers"]
+	path = external/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git
+
+[submodule "external/SPIRV-Reflect"]
+	path = external/SPIRV-Reflect
+	url = https://github.com/KhronosGroup/SPIRV-Reflect.git
+
+[submodule "external/SPIRV-Tools"]
+	path = external/SPIRV-Tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+	
+[submodule "external/stb"]
+	path = external/stb
+	url = https://github.com/nothings/stb.git
