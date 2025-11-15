@@ -1,53 +1,163 @@
 #include "attentionNode.h"
+#include "../testHelpers.h"
 #include "../../core/neuralNet.h"
 #include "../../core/error.h"
 #include <iostream>
 #include <iomanip>
-#include <fstream>
 #include <sstream>
 #include <cmath>
-
-// JSON parsing helper
-#include <nlohmann/json.hpp>
+#include <functional>
 
 using namespace vk;
-using json = nlohmann::json;
 
 // Global device and descriptor pool (defined in embeddingNodeTest.cpp)
 extern Device netGlobalDevice;
 extern DescriptorPool gDestSetPool;
 
-// Helper function to load JSON test data
-json loadTestData(const std::string& filename)
-{
-    std::ifstream file(filename);
-    if (!file.is_open()) {
-        throw std::runtime_error("Could not open test data file: " + filename);
-    }
+// ============================================================================
+// Helper Functions for Test Code
+// ============================================================================
 
-    json data;
-    file >> data;
-    return data;
+struct TestConfig {
+    uint32_t batch_size, seq_len, d_in, d_out, num_heads, head_dim;
+};
+
+void printTestConfig(const TestConfig& config) {
+    std::cout << "Config:" << std::endl;
+    std::cout << "  Batch size: " << config.batch_size << std::endl;
+    std::cout << "  Sequence length: " << config.seq_len << std::endl;
+    std::cout << "  d_in: " << config.d_in << std::endl;
+    std::cout << "  d_out: " << config.d_out << std::endl;
+    std::cout << "  num_heads: " << config.num_heads << std::endl;
+    if (config.head_dim > 0) {
+        std::cout << "  head_dim: " << config.head_dim << std::endl;
+    }
 }
 
-// Helper function to convert JSON array to std::vector<float>
-void flattenJson(const json& j, std::vector<float>& result)
-{
-    if (j.is_array()) {
-        for (const auto& elem : j) {
-            flattenJson(elem, result);
+std::vector<float> runInferenceAndGetOutput(NeuralNet& net, const Tensor& inputTensor, uint32_t output_size) {
+    Tensor result = net(inputTensor)[0];
+
+    Buffer outBuffer = netGlobalDevice.createBuffer({
+        .size = output_size * sizeof(float),
+        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        .reqMemProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+    });
+
+    netGlobalDevice.newCommandBuffer(queue_compute)
+        .begin()
+        .copyBuffer(outBuffer, result.buffer())
+        .end()
+        .submit()
+        .wait();
+
+    float* data = (float*)outBuffer.map();
+    return std::vector<float>(data, data + output_size);
+}
+
+bool performSanityChecks(const std::vector<float>& data) {
+    bool has_nan = false, has_inf = false, all_zero = true;
+    float min_val = data[0], max_val = data[0];
+
+    for (float val : data) {
+        if (std::isnan(val)) has_nan = true;
+        if (std::isinf(val)) has_inf = true;
+        if (val != 0.0f) all_zero = false;
+        min_val = std::min(min_val, val);
+        max_val = std::max(max_val, val);
+    }
+
+    std::cout << "\nSanity checks:" << std::endl;
+    std::cout << "  Has NaN: " << (has_nan ? "YES ✗" : "NO ✓") << std::endl;
+    std::cout << "  Has Inf: " << (has_inf ? "YES ✗" : "NO ✓") << std::endl;
+    std::cout << "  All zero: " << (all_zero ? "YES ✗" : "NO ✓") << std::endl;
+    std::cout << "  Value range: [" << min_val << ", " << max_val << "]" << std::endl;
+
+    return !has_nan && !has_inf && !all_zero;
+}
+
+void printComparisonResults(const std::vector<float>& actual, const std::vector<float>& expected, uint32_t d_out) {
+    std::cout << "\n  First token (batch 0, token 0):" << std::endl;
+    std::cout << "    Expected: ";
+    for (size_t i = 0; i < d_out; ++i) {
+        std::cout << std::fixed << std::setprecision(4) << expected[i] << " ";
+    }
+    std::cout << std::endl;
+
+    std::cout << "    Actual:   ";
+    for (size_t i = 0; i < d_out; ++i) {
+        std::cout << std::fixed << std::setprecision(4) << actual[i] << " ";
+    }
+    std::cout << std::endl;
+}
+
+struct ErrorStats {
+    float max_error;
+    float avg_error;
+    int error_count;
+};
+
+ErrorStats calculateErrors(const std::vector<float>& actual, const std::vector<float>& expected, float threshold = 0.01f) {
+    ErrorStats stats = {0.0f, 0.0f, 0};
+
+    for (size_t i = 0; i < expected.size(); ++i) {
+        float error = std::abs(actual[i] - expected[i]);
+        stats.avg_error += error;
+        stats.max_error = std::max(stats.max_error, error);
+        if (error > threshold) {
+            stats.error_count++;
         }
-    } else if (j.is_number()) {
-        result.push_back(j.get<float>());
     }
+
+    stats.avg_error /= expected.size();
+    return stats;
 }
 
-std::vector<float> jsonToVector(const json& j)
-{
-    std::vector<float> result;
-    flattenJson(j, result);
-    return result;
-}
+// ============================================================================
+// Generic Test Framework
+// ============================================================================
+
+template<typename NodeType>
+struct TestFramework {
+    using SetupWeightsFn = std::function<void(NodeType&)>;
+    using CreateInputFn = std::function<Tensor()>;
+    using VerifyResultsFn = std::function<bool(const std::vector<float>&)>;
+
+    static std::vector<float> runTest(
+        NodeType& node,
+        CreateInputFn createInput,
+        SetupWeightsFn setupWeights,
+        uint32_t output_size)
+    {
+        NeuralNet net(netGlobalDevice, 1, 1);
+        net.input(0) - node - net.output(0);
+
+        setupWeights(node);
+        Tensor inputTensor = createInput();
+
+        return runInferenceAndGetOutput(net, inputTensor, output_size);
+    }
+
+    static bool runReferenceTest(
+        NodeType& node,
+        const json& testData,
+        CreateInputFn createInput,
+        SetupWeightsFn setupWeights,
+        uint32_t output_size,
+        float error_threshold = 0.1f)
+    {
+        std::vector<float> output = runTest(node, createInput, setupWeights, output_size);
+        std::vector<float> expected = jsonToVector(testData["output"]);
+
+        ErrorStats stats = calculateErrors(output, expected);
+
+        std::cout << "\n  Error statistics:" << std::endl;
+        std::cout << "    Max error: " << std::fixed << std::setprecision(6) << stats.max_error << std::endl;
+        std::cout << "    Avg error: " << stats.avg_error << std::endl;
+        std::cout << "    Values with error > 0.01: " << stats.error_count << " / " << expected.size() << std::endl;
+
+        return stats.max_error < error_threshold;
+    }
+};
 
 void testLinear()
 {
@@ -116,96 +226,47 @@ void testMultiHeadAttentionSimple()
 {
     std::cout << "\n========== Test: Multi-Head Attention (Simple Input) ===========" << std::endl;
 
-    const uint32_t batch_size = 1;
-    const uint32_t seq_len = 2;
-    const uint32_t d_model = 4;
-    const uint32_t num_heads = 2;
+    TestConfig config = {1, 2, 4, 4, 2, 0};  // batch_size, seq_len, d_in, d_out, num_heads, head_dim
+    printTestConfig(config);
 
-    std::cout << "Config:" << std::endl;
-    std::cout << "  Batch size: " << batch_size << std::endl;
-    std::cout << "  Sequence length: " << seq_len << std::endl;
-    std::cout << "  d_model: " << d_model << std::endl;
-    std::cout << "  num_heads: " << num_heads << std::endl;
-
-    // Create neural network
+    // Create network with simple input and weights (all 1.0 input, all 0.1 weights)
     NeuralNet net(netGlobalDevice, 1, 1);
-    MultiHeadAttentionNode mha(d_model, num_heads);
-
+    MultiHeadAttentionNode mha(config.d_in, config.d_out, config.num_heads);
     net.input(0) - mha - net.output(0);
 
-    // Simple input: all values = 1.0
-    std::vector<float> input_data(batch_size * seq_len * d_model, 1.0f);
-    Tensor inputTensor = Tensor(batch_size, seq_len, d_model).set(input_data);
+    std::vector<float> input_data(config.batch_size * config.seq_len * config.d_in, 1.0f);
+    Tensor inputTensor = Tensor(config.batch_size, config.seq_len, config.d_in).set(input_data);
 
     std::cout << "Input: all values = 1.0" << std::endl;
-
-    // Simple weights: identity-like patterns
-    std::vector<float> W_q(d_model * d_model, 0.1f);
-    std::vector<float> W_k(d_model * d_model, 0.1f);
-    std::vector<float> W_v(d_model * d_model, 0.1f);
-    std::vector<float> W_out(d_model * d_model, 0.1f);
-
-    mha["W_query"] = Tensor(d_model, d_model).set(W_q);
-    mha["W_key"] = Tensor(d_model, d_model).set(W_k);
-    mha["W_value"] = Tensor(d_model, d_model).set(W_v);
-    mha["W_out"] = Tensor(d_model, d_model).set(W_out);
-
     std::cout << "Weights: all values = 0.1" << std::endl;
+
+    mha["W_query"] = Tensor(config.d_in, config.d_in).set(std::vector<float>(config.d_in * config.d_in, 0.1f));
+    mha["W_key"] = Tensor(config.d_in, config.d_in).set(std::vector<float>(config.d_in * config.d_in, 0.1f));
+    mha["W_value"] = Tensor(config.d_in, config.d_in).set(std::vector<float>(config.d_in * config.d_in, 0.1f));
+    mha["W_out"] = Tensor(config.d_out, config.d_in).set(std::vector<float>(config.d_out * config.d_in, 0.1f));
+
     std::cout << "Running inference..." << std::endl;
 
-    // Run inference
-    Tensor result = net(inputTensor)[0];
+    // Run inference and get output
+    std::vector<float> output = runInferenceAndGetOutput(net, inputTensor, config.batch_size * config.seq_len * config.d_out);
 
-    // Copy result back
-    Buffer outBuffer = netGlobalDevice.createBuffer({
-        .size = batch_size * seq_len * d_model * sizeof(float),
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .reqMemProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    });
-
-    netGlobalDevice.newCommandBuffer(queue_compute)
-        .begin()
-        .copyBuffer(outBuffer, result.buffer())
-        .end()
-        .submit()
-        .wait();
-
-    float* data = (float*)outBuffer.map();
-
+    // Print output
     std::cout << "\nOutput (first token): ";
-    for (int i = 0; i < d_model; ++i) {
-        std::cout << std::fixed << std::setprecision(4) << data[i] << " ";
+    for (uint32_t i = 0; i < config.d_out; ++i) {
+        std::cout << std::fixed << std::setprecision(4) << output[i] << " ";
     }
     std::cout << std::endl;
 
     std::cout << "Output (second token): ";
-    for (int i = 0; i < d_model; ++i) {
-        std::cout << std::fixed << std::setprecision(4) << data[d_model + i] << " ";
+    for (uint32_t i = 0; i < config.d_out; ++i) {
+        std::cout << std::fixed << std::setprecision(4) << output[config.d_out + i] << " ";
     }
     std::cout << std::endl;
 
-    // Basic sanity checks
-    bool has_nan = false;
-    bool has_inf = false;
-    bool all_zero = true;
-    float min_val = data[0];
-    float max_val = data[0];
+    // Sanity checks
+    bool passed = performSanityChecks(output);
 
-    for (size_t i = 0; i < batch_size * seq_len * d_model; ++i) {
-        if (std::isnan(data[i])) has_nan = true;
-        if (std::isinf(data[i])) has_inf = true;
-        if (data[i] != 0.0f) all_zero = false;
-        min_val = std::min(min_val, data[i]);
-        max_val = std::max(max_val, data[i]);
-    }
-
-    std::cout << "\nSanity checks:" << std::endl;
-    std::cout << "  Has NaN: " << (has_nan ? "YES ✗" : "NO ✓") << std::endl;
-    std::cout << "  Has Inf: " << (has_inf ? "YES ✗" : "NO ✓") << std::endl;
-    std::cout << "  All zero: " << (all_zero ? "YES ✗" : "NO ✓") << std::endl;
-    std::cout << "  Value range: [" << min_val << ", " << max_val << "]" << std::endl;
-
-    if (!has_nan && !has_inf && !all_zero) {
+    if (passed) {
         std::cout << "\n✓ Simple input test PASSED - basic functionality working" << std::endl;
     } else {
         std::cout << "\n✗ Simple input test FAILED - check implementation" << std::endl;
@@ -215,115 +276,67 @@ void testMultiHeadAttentionSimple()
 void testMultiHeadAttentionReference()
 {
     std::cout << "\n========== Test: Multi-Head Attention (Reference Data) ===========" << std::endl;
-
-    // Load reference test data
     std::cout << "Loading reference test data..." << std::endl;
 
     std::string testDataPath = std::string(PROJECT_CURRENT_DIR) + "/model/attention/mha_test_data.json";
     json testData = loadTestData(testDataPath);
 
-    uint32_t batch_size = testData["config"]["batch_size"];
-    uint32_t seq_len = testData["config"]["seq_len"];
-    uint32_t d_model = testData["config"]["d_model"];
-    uint32_t num_heads = testData["config"]["num_heads"];
-    uint32_t head_dim = testData["config"]["head_dim"];
+    // Load config (support both old and new format)
+    TestConfig config;
+    config.batch_size = testData["config"]["batch_size"];
+    config.seq_len = testData["config"]["seq_len"];
+    if (testData["config"].contains("d_in") && testData["config"].contains("d_out")) {
+        config.d_in = testData["config"]["d_in"];
+        config.d_out = testData["config"]["d_out"];
+    } else {
+        uint32_t d_model = testData["config"]["d_model"];
+        config.d_in = config.d_out = d_model;
+    }
+    config.num_heads = testData["config"]["num_heads"];
+    config.head_dim = testData["config"]["head_dim"];
 
-    std::cout << "Config:" << std::endl;
-    std::cout << "  Batch size: " << batch_size << std::endl;
-    std::cout << "  Sequence length: " << seq_len << std::endl;
-    std::cout << "  d_model: " << d_model << std::endl;
-    std::cout << "  num_heads: " << num_heads << std::endl;
-    std::cout << "  head_dim: " << head_dim << std::endl;
+    printTestConfig(config);
 
-    // Create neural network
-    NeuralNet net(netGlobalDevice, 1, 1);
-    MultiHeadAttentionNode mha(d_model, num_heads);
+    // Create node
+    MultiHeadAttentionNode mha(config.d_in, config.d_out, config.num_heads);
 
-    net.input(0) - mha - net.output(0);
+    // Use test framework
+    auto createInput = [&]() {
+        std::vector<float> input_data = jsonToVector(testData["input"]);
+        std::cout << "Input loaded: " << input_data.size() << " values" << std::endl;
+        return Tensor(config.batch_size, config.seq_len, config.d_in).set(input_data);
+    };
 
-    // Load input
-    std::vector<float> input_data = jsonToVector(testData["input"]);
-    Tensor inputTensor = Tensor(batch_size, seq_len, d_model).set(input_data);
-
-    std::cout << "Input loaded: " << input_data.size() << " values" << std::endl;
-
-    // Load weights
-    std::vector<float> W_q = jsonToVector(testData["weights"]["W_query"]);
-    std::vector<float> W_k = jsonToVector(testData["weights"]["W_key"]);
-    std::vector<float> W_v = jsonToVector(testData["weights"]["W_value"]);
-    std::vector<float> W_out = jsonToVector(testData["weights"]["W_out"]);
-
-    mha["W_query"] = Tensor(d_model, d_model).set(W_q);
-    mha["W_key"] = Tensor(d_model, d_model).set(W_k);
-    mha["W_value"] = Tensor(d_model, d_model).set(W_v);
-    mha["W_out"] = Tensor(d_model, d_model).set(W_out);
-
-    std::cout << "Weights loaded" << std::endl;
+    auto setupWeights = [&](MultiHeadAttentionNode& node) {
+        node["W_query"] = Tensor(config.d_in, config.d_in).set(jsonToVector(testData["weights"]["W_query"]));
+        node["W_key"] = Tensor(config.d_in, config.d_in).set(jsonToVector(testData["weights"]["W_key"]));
+        node["W_value"] = Tensor(config.d_in, config.d_in).set(jsonToVector(testData["weights"]["W_value"]));
+        node["W_out"] = Tensor(config.d_out, config.d_in).set(jsonToVector(testData["weights"]["W_out"]));
+        std::cout << "Weights loaded" << std::endl;
+    };
 
     std::cout << "Running inference..." << std::endl;
 
-    // Run inference
-    Tensor result = net(inputTensor)[0];
+    uint32_t output_size = config.batch_size * config.seq_len * config.d_out;
+    std::vector<float> output = TestFramework<MultiHeadAttentionNode>::runTest(
+        mha, createInput, setupWeights, output_size);
 
-    // Copy result back
-    Buffer outBuffer = netGlobalDevice.createBuffer({
-        .size = batch_size * seq_len * d_model * sizeof(float),
-        .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-        .reqMemProps = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-    });
-
-    netGlobalDevice.newCommandBuffer(queue_compute)
-        .begin()
-        .copyBuffer(outBuffer, result.buffer())
-        .end()
-        .submit()
-        .wait();
-
-    float* data = (float*)outBuffer.map();
-
-    // Load expected output
     std::vector<float> expected_output = jsonToVector(testData["output"]);
 
     std::cout << "\nVerifying results..." << std::endl;
     std::cout << "  Expected output size: " << expected_output.size() << std::endl;
-    std::cout << "  Actual output size: " << batch_size * seq_len * d_model << std::endl;
+    std::cout << "  Actual output size: " << output.size() << std::endl;
 
-    // Compare first token
-    std::cout << "\n  First token (batch 0, token 0):" << std::endl;
-    std::cout << "    Expected: ";
-    for (int i = 0; i < d_model; ++i) {
-        std::cout << std::fixed << std::setprecision(4) << expected_output[i] << " ";
-    }
-    std::cout << std::endl;
+    printComparisonResults(output, expected_output, config.d_out);
 
-    std::cout << "    Actual:   ";
-    for (int i = 0; i < d_model; ++i) {
-        std::cout << std::fixed << std::setprecision(4) << data[i] << " ";
-    }
-    std::cout << std::endl;
-
-    // Calculate error
-    float max_error = 0.0f;
-    float avg_error = 0.0f;
-    int error_count = 0;
-
-    for (size_t i = 0; i < expected_output.size(); ++i) {
-        float error = std::abs(data[i] - expected_output[i]);
-        avg_error += error;
-        max_error = std::max(max_error, error);
-        if (error > 0.01f) {
-            error_count++;
-        }
-    }
-
-    avg_error /= expected_output.size();
+    ErrorStats stats = calculateErrors(output, expected_output);
 
     std::cout << "\n  Error statistics:" << std::endl;
-    std::cout << "    Max error: " << std::fixed << std::setprecision(6) << max_error << std::endl;
-    std::cout << "    Avg error: " << avg_error << std::endl;
-    std::cout << "    Values with error > 0.01: " << error_count << " / " << expected_output.size() << std::endl;
+    std::cout << "    Max error: " << std::fixed << std::setprecision(6) << stats.max_error << std::endl;
+    std::cout << "    Avg error: " << stats.avg_error << std::endl;
+    std::cout << "    Values with error > 0.01: " << stats.error_count << " / " << expected_output.size() << std::endl;
 
-    if (max_error < 0.1f) {
+    if (stats.max_error < 0.1f) {
         std::cout << "\n✓ Multi-Head Attention numerical verification PASSED" << std::endl;
     } else {
         std::cout << "\n✗ Multi-Head Attention numerical verification FAILED" << std::endl;

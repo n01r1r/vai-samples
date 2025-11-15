@@ -211,16 +211,16 @@ static const char* src_qkv_projection = R"(
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) buffer Q { float q[]; };        // [B*S*D]
-layout(set = 0, binding = 1) buffer K { float k[]; };        // [B*S*D]
-layout(set = 0, binding = 2) buffer V { float v[]; };        // [B*S*D]
-layout(set = 0, binding = 3) buffer Input { float x[]; };    // [B*S*D]
-layout(set = 0, binding = 4) buffer Wq { float wq[]; };      // [D*D]
-layout(set = 0, binding = 5) buffer Wk { float wk[]; };      // [D*D]
-layout(set = 0, binding = 6) buffer Wv { float wv[]; };      // [D*D]
+layout(set = 0, binding = 0) buffer Q { float q[]; };        // [B*S*d_in]
+layout(set = 0, binding = 1) buffer K { float k[]; };        // [B*S*d_in]
+layout(set = 0, binding = 2) buffer V { float v[]; };        // [B*S*d_in]
+layout(set = 0, binding = 3) buffer Input { float x[]; };    // [B*S*d_in]
+layout(set = 0, binding = 4) buffer Wq { float wq[]; };      // [d_in*d_in]
+layout(set = 0, binding = 5) buffer Wk { float wk[]; };      // [d_in*d_in]
+layout(set = 0, binding = 6) buffer Wv { float wv[]; };      // [d_in*d_in]
 
 layout(push_constant) uniform PushConstants {
-    int B, S, D;
+    int B, S, D;  // D = d_in
 };
 
 void main() {
@@ -254,15 +254,15 @@ void main() {
 )";
 
 // Shader 2: Compute attention scores: Q @ K^T / sqrt(head_dim)
-// Input Q, K: [B, S, D] where D = H * HD
+// Input Q, K: [B, S, d_in] where d_in = H * HD
 // Output scores: [B, H, S, S]
 static const char* src_attention_scores = R"(
 #version 450
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) buffer Scores { float scores[]; };  // [B*H*S*S]
-layout(set = 0, binding = 1) buffer Q { float q[]; };             // [B*S*D]
-layout(set = 0, binding = 2) buffer K { float k[]; };             // [B*S*D]
+layout(set = 0, binding = 1) buffer Q { float q[]; };             // [B*S*d_in]
+layout(set = 0, binding = 2) buffer K { float k[]; };             // [B*S*d_in]
 
 layout(push_constant) uniform PushConstants {
     int B, H, S, HD;
@@ -326,7 +326,7 @@ void main() {
 )";
 
 // Shader 4: Weighted sum: context = attn_weights @ V
-// Input V: [B, S, D] where D = H * HD
+// Input V: [B, S, d_in] where d_in = H * HD
 // Output context: [B, H, S, HD]
 static const char* src_weighted_sum = R"(
 #version 450
@@ -334,7 +334,7 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0) buffer Context { float ctx[]; };         // [B*H*S*HD]
 layout(set = 0, binding = 1) buffer AttnWeights { float attn[]; };    // [B*H*S*S]
-layout(set = 0, binding = 2) buffer V { float v[]; };                 // [B*S*D]
+layout(set = 0, binding = 2) buffer V { float v[]; };                 // [B*S*d_in]
 
 layout(push_constant) uniform PushConstants {
     int B, H, S, HD;
@@ -367,12 +367,12 @@ void main() {
 
 // Shader 5: Combine heads and reshape
 // Input: [B, H, S, HD]
-// Output: [B, S, D] where D = H * HD
+// Output: [B, S, d_in] where d_in = H * HD
 static const char* src_combine_heads = R"(
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) buffer Output { float out0[]; };     // [B*S*D]
+layout(set = 0, binding = 0) buffer Output { float out0[]; };     // [B*S*d_in]
 layout(set = 0, binding = 1) buffer Context { float ctx[]; };     // [B*H*S*HD]
 
 layout(push_constant) uniform PushConstants {
@@ -398,11 +398,11 @@ void main() {
 }
 )";
 
-MultiHeadAttentionNode::MultiHeadAttentionNode(uint32_t d_model, uint32_t num_heads)
-    : d_model(d_model), num_heads(num_heads)
+MultiHeadAttentionNode::MultiHeadAttentionNode(uint32_t d_in, uint32_t d_out, uint32_t num_heads)
+    : d_in(d_in), d_out(d_out), num_heads(num_heads)
 {
-    _ASSERT(d_model % num_heads == 0);
-    head_dim = d_model / num_heads;
+    _ASSERT(d_in % num_heads == 0);
+    head_dim = d_in / num_heads;
 
     addSlot("in0", NodeSlot::input);
     addSlot("W_query", NodeSlot::internal);
@@ -436,8 +436,8 @@ void MultiHeadAttentionNode::prepare()
 
     uint32_t B = input.shape()[0];
     uint32_t S = input.shape()[1];
-    uint32_t D = input.shape()[2];
-    _ASSERT(D == d_model);
+    uint32_t D = input.shape()[2];  // Should be d_in
+    _ASSERT(D == d_in);
 
     // Initialize weights if not set
     Tensor& W_q = (*this)["W_query"];
@@ -445,12 +445,14 @@ void MultiHeadAttentionNode::prepare()
     Tensor& W_v = (*this)["W_value"];
     Tensor& W_out = (*this)["W_out"];
 
-    if (!W_q.validShape()) W_q = Tensor(d_model, d_model);
-    if (!W_k.validShape()) W_k = Tensor(d_model, d_model);
-    if (!W_v.validShape()) W_v = Tensor(d_model, d_model);
-    if (!W_out.validShape()) W_out = Tensor(d_model, d_model);
+    // Q, K, V projections: (d_in, d_in)
+    if (!W_q.validShape()) W_q = Tensor(d_in, d_in);
+    if (!W_k.validShape()) W_k = Tensor(d_in, d_in);
+    if (!W_v.validShape()) W_v = Tensor(d_in, d_in);
+    // Output projection: (d_out, d_in)
+    if (!W_out.validShape()) W_out = Tensor(d_out, d_in);
 
-    (*this)["out0"] = Tensor(B, S, d_model);
+    (*this)["out0"] = Tensor(B, S, d_out);
 }
 
 void MultiHeadAttentionNode::run(CommandBuffer cmdBuff)
@@ -464,194 +466,183 @@ void MultiHeadAttentionNode::run(CommandBuffer cmdBuff)
 
     uint32_t B = input.shape()[0];
     uint32_t S = input.shape()[1];
-    uint32_t D = d_model;
+    uint32_t D = d_in;
     uint32_t H = num_heads;
     uint32_t HD = head_dim;
 
     // Allocate temporary buffers
+    IntermediateTensors tensors = allocateIntermediateBuffers(B, S, D, H, HD);
+
+    // Execute attention mechanism in stages
+    computeQKVProjection(cmdBuff, input, tensors, W_q, W_k, W_v, B, S, D);
+    computeAttentionScores(cmdBuff, tensors, B, H, S, HD);
+    applyCausalMaskToScores(cmdBuff, tensors, B, H, S);
+    computeSoftmax(cmdBuff, tensors, B, H, S);
+    computeWeightedSum(cmdBuff, tensors, B, H, S, HD);
+    combineHeadsAndProject(cmdBuff, tensors, W_out, output, B, S, D, H, HD);
+}
+
+// ============================================================================
+// Private Helper Functions for MultiHeadAttentionNode
+// ============================================================================
+
+MultiHeadAttentionNode::IntermediateTensors
+MultiHeadAttentionNode::allocateIntermediateBuffers(uint32_t B, uint32_t S, uint32_t D, uint32_t H, uint32_t HD)
+{
     BufferPool& pool = BufferPool::get();
+    IntermediateTensors tensors;
 
-    Tensor Q_flat(B, S, D);
-    Tensor K_flat(B, S, D);
-    Tensor V_flat(B, S, D);
-    Q_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
-    K_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
-    V_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
+    tensors.Q_flat = Tensor(B, S, D);
+    tensors.K_flat = Tensor(B, S, D);
+    tensors.V_flat = Tensor(B, S, D);
+    tensors.Q_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
+    tensors.K_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
+    tensors.V_flat.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
 
-    Tensor scores(B, H, S, S);
-    scores.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*S*sizeof(float)));
+    tensors.scores = Tensor(B, H, S, S);
+    tensors.scores.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*S*sizeof(float)));
 
-    Tensor attn_weights(B, H, S, S);
-    attn_weights.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*S*sizeof(float)));
+    tensors.attn_weights = Tensor(B, H, S, S);
+    tensors.attn_weights.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*S*sizeof(float)));
 
-    Tensor context(B, H, S, HD);
-    context.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*HD*sizeof(float)));
+    tensors.context = Tensor(B, H, S, HD);
+    tensors.context.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*H*S*HD*sizeof(float)));
 
-    Tensor context_combined(B, S, D);
-    context_combined.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
+    tensors.context_combined = Tensor(B, S, D);
+    tensors.context_combined.bindBuffer(pool.requestBuffer(netGlobalDevice, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, B*S*D*sizeof(float)));
 
-    // Step 1: Q, K, V projection
-    {
-        qkvProjDescSet.write({
-            Q_flat.buffer(), K_flat.buffer(), V_flat.buffer(),
-            input.buffer(),
-            W_q.buffer(), W_k.buffer(), W_v.buffer()
-        });
+    return tensors;
+}
 
-        int constants[] = {(int)B, (int)S, (int)D};
+void MultiHeadAttentionNode::computeQKVProjection(CommandBuffer& cmdBuff, const Tensor& input, IntermediateTensors& tensors,
+                                                   const Tensor& W_q, const Tensor& W_k, const Tensor& W_v,
+                                                   uint32_t B, uint32_t S, uint32_t D)
+{
+    qkvProjDescSet.write({
+        tensors.Q_flat.buffer(), tensors.K_flat.buffer(), tensors.V_flat.buffer(),
+        input.buffer(),
+        W_q.buffer(), W_k.buffer(), W_v.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(qkvProjection)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({qkvProjDescSet})
-            .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(D, 16))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / Q_flat.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            )
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / K_flat.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            )
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / V_flat.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants[] = {(int)B, (int)S, (int)D};
 
-    // Step 2: Compute attention scores
-    // Note: We treat Q, K as already reshaped to [B, H, S, HD]
-    {
-        scoresDescSet.write({
-            scores.buffer(),
-            Q_flat.buffer(),
-            K_flat.buffer()
-        });
+    cmdBuff
+        .bindPipeline(qkvProjection)
+        .setPushConstants(0, sizeof(constants), constants)
+        .bindDescSets({qkvProjDescSet})
+        .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(D, 16))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.Q_flat.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.K_flat.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.V_flat.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
+}
 
-        float scale = 1.0f / std::sqrt(static_cast<float>(HD));
-        struct { int B, H, S, HD; float scale; } constants = {(int)B, (int)H, (int)S, (int)HD, scale};
+void MultiHeadAttentionNode::computeAttentionScores(CommandBuffer& cmdBuff, IntermediateTensors& tensors,
+                                                      uint32_t B, uint32_t H, uint32_t S, uint32_t HD)
+{
+    scoresDescSet.write({
+        tensors.scores.buffer(),
+        tensors.Q_flat.buffer(),
+        tensors.K_flat.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(attentionScores)
-            .setPushConstants(0, sizeof(constants), &constants)
-            .bindDescSets({scoresDescSet})
-            .dispatch(CEIL_DIV(B*H, 8), CEIL_DIV(S, 8))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / scores.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    float scale = 1.0f / std::sqrt(static_cast<float>(HD));
+    struct { int B, H, S, HD; float scale; } constants = {(int)B, (int)H, (int)S, (int)HD, scale};
 
-    // Step 3: Apply causal mask
-    {
-        maskDescSet.write({scores.buffer()});
+    cmdBuff
+        .bindPipeline(attentionScores)
+        .setPushConstants(0, sizeof(constants), &constants)
+        .bindDescSets({scoresDescSet})
+        .dispatch(CEIL_DIV(B*H, 8), CEIL_DIV(S, 8))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.scores.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
+}
 
-        int constants[] = {(int)B, (int)H, (int)S};
+void MultiHeadAttentionNode::applyCausalMaskToScores(CommandBuffer& cmdBuff, IntermediateTensors& tensors,
+                                                       uint32_t B, uint32_t H, uint32_t S)
+{
+    maskDescSet.write({tensors.scores.buffer()});
 
-        cmdBuff
-            .bindPipeline(applyCausalMask)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({maskDescSet})
-            .dispatch(CEIL_DIV(B*H*S*S, 256))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / scores.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants[] = {(int)B, (int)H, (int)S};
 
-    // Step 4: Softmax
-    {
-        softmaxDescSet.write({
-            attn_weights.buffer(),
-            scores.buffer()
-        });
+    cmdBuff
+        .bindPipeline(applyCausalMask)
+        .setPushConstants(0, sizeof(constants), constants)
+        .bindDescSets({maskDescSet})
+        .dispatch(CEIL_DIV(B*H*S*S, 256))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.scores.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
+}
 
-        int constants[] = {(int)(B * H * S), (int)S};
+void MultiHeadAttentionNode::computeSoftmax(CommandBuffer& cmdBuff, IntermediateTensors& tensors,
+                                              uint32_t B, uint32_t H, uint32_t S)
+{
+    softmaxDescSet.write({
+        tensors.attn_weights.buffer(),
+        tensors.scores.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(softmaxPipeline)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({softmaxDescSet})
-            .dispatch(CEIL_DIV(B * H * S, 64))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / attn_weights.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants[] = {(int)(B * H * S), (int)S};
 
-    // Step 5: Weighted sum
-    {
-        weightedSumDescSet.write({
-            context.buffer(),
-            attn_weights.buffer(),
-            V_flat.buffer()
-        });
+    cmdBuff
+        .bindPipeline(softmaxPipeline)
+        .setPushConstants(0, sizeof(constants), constants)
+        .bindDescSets({softmaxDescSet})
+        .dispatch(CEIL_DIV(B * H * S, 64))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.attn_weights.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
+}
 
-        int constants[] = {(int)B, (int)H, (int)S, (int)HD};
+void MultiHeadAttentionNode::computeWeightedSum(CommandBuffer& cmdBuff, IntermediateTensors& tensors,
+                                                  uint32_t B, uint32_t H, uint32_t S, uint32_t HD)
+{
+    weightedSumDescSet.write({
+        tensors.context.buffer(),
+        tensors.attn_weights.buffer(),
+        tensors.V_flat.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(weightedSum)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({weightedSumDescSet})
-            .dispatch(CEIL_DIV(B*H, 8), CEIL_DIV(S, 8))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / context.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants[] = {(int)B, (int)H, (int)S, (int)HD};
 
-    // Step 6: Combine heads
-    {
-        combineDescSet.write({
-            context_combined.buffer(),
-            context.buffer()
-        });
+    cmdBuff
+        .bindPipeline(weightedSum)
+        .setPushConstants(0, sizeof(constants), constants)
+        .bindDescSets({weightedSumDescSet})
+        .dispatch(CEIL_DIV(B*H, 8), CEIL_DIV(S, 8))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.context.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
+}
 
-        int constants[] = {(int)B, (int)H, (int)S, (int)HD};
+void MultiHeadAttentionNode::combineHeadsAndProject(CommandBuffer& cmdBuff, IntermediateTensors& tensors,
+                                                      const Tensor& W_out, Tensor& output,
+                                                      uint32_t B, uint32_t S, uint32_t D, uint32_t H, uint32_t HD)
+{
+    // Combine heads
+    combineDescSet.write({
+        tensors.context_combined.buffer(),
+        tensors.context.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(combineHeads)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({combineDescSet})
-            .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(D, 16))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / context_combined.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants1[] = {(int)B, (int)H, (int)S, (int)HD};
 
-    // Step 7: Output projection
-    // output = context_combined @ W_out^T
-    {
-        // Reuse linear pipeline
-        ComputePipeline outProjPipeline = requestPipeline(src_linear);
-        DescriptorSet outProjDescSet = outProjPipeline.descSetLayout(0).newDescSet(gDestSetPool);
+    cmdBuff
+        .bindPipeline(combineHeads)
+        .setPushConstants(0, sizeof(constants1), constants1)
+        .bindDescSets({combineDescSet})
+        .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(D, 16))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / tensors.context_combined.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
 
-        outProjDescSet.write({
-            output.buffer(),
-            context_combined.buffer(),
-            W_out.buffer()
-        });
+    // Output projection
+    ComputePipeline outProjPipeline = requestPipeline(src_linear);
+    DescriptorSet outProjDescSet = outProjPipeline.descSetLayout(0).newDescSet(gDestSetPool);
 
-        int constants[] = {(int)B, (int)S, (int)D, (int)D};
+    outProjDescSet.write({
+        output.buffer(),
+        tensors.context_combined.buffer(),
+        W_out.buffer()
+    });
 
-        cmdBuff
-            .bindPipeline(outProjPipeline)
-            .setPushConstants(0, sizeof(constants), constants)
-            .bindDescSets({outProjDescSet})
-            .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(D, 16))
-            .barrier(
-                (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
-                / output.buffer()
-                / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
-            );
-    }
+    int constants2[] = {(int)B, (int)S, (int)D, (int)d_out};
+
+    cmdBuff
+        .bindPipeline(outProjPipeline)
+        .setPushConstants(0, sizeof(constants2), constants2)
+        .bindDescSets({outProjDescSet})
+        .dispatch(CEIL_DIV(B*S, 16), CEIL_DIV(d_out, 16))
+        .barrier((PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE) / output.buffer() / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ));
 }

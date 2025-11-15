@@ -24,22 +24,23 @@ def multi_head_attention(x, W_q, W_k, W_v, W_out, num_heads):
     Multi-head attention implementation
 
     Args:
-        x: (batch, seq_len, d_model)
-        W_q, W_k, W_v: (d_model, d_model) - weight matrices
-        W_out: (d_model, d_model) - output projection
+        x: (batch, seq_len, d_in)
+        W_q, W_k, W_v: (d_in, d_in) - weight matrices (input projection)
+        W_out: (d_out, d_in) - output projection
         num_heads: number of attention heads
 
     Returns:
-        output: (batch, seq_len, d_model)
+        output: (batch, seq_len, d_out)
         intermediates: dictionary with intermediate results
     """
-    batch, seq_len, d_model = x.shape
-    head_dim = d_model // num_heads
+    batch, seq_len, d_in = x.shape
+    d_out = W_out.shape[0]  # Output dimension from W_out
+    head_dim = d_in // num_heads
 
-    # Project to Q, K, V
-    Q = linear(x, W_q)  # (batch, seq_len, d_model)
-    K = linear(x, W_k)
-    V = linear(x, W_v)
+    # Project to Q, K, V (all use d_in)
+    Q = linear(x, W_q)  # (batch, seq_len, d_in)
+    K = linear(x, W_k)  # (batch, seq_len, d_in)
+    V = linear(x, W_v)  # (batch, seq_len, d_in)
 
     # Reshape for multi-head: (batch, seq_len, num_heads, head_dim)
     Q = Q.reshape(batch, seq_len, num_heads, head_dim)
@@ -71,10 +72,10 @@ def multi_head_attention(x, W_q, W_k, W_v, W_out, num_heads):
     # Combine heads: (batch, seq_len, num_heads, head_dim)
     context = context.transpose(0, 2, 1, 3)
 
-    # Reshape: (batch, seq_len, d_model)
-    context = context.reshape(batch, seq_len, d_model)
+    # Reshape: (batch, seq_len, d_in)
+    context = context.reshape(batch, seq_len, d_in)
 
-    # Output projection
+    # Output projection: (batch, seq_len, d_out)
     output = linear(context, W_out)
 
     intermediates = {
@@ -95,16 +96,18 @@ def generate_test_case():
     # Small dimensions for manual verification
     batch_size = 2
     seq_len = 3
-    d_model = 8
+    d_in = 8   # Input dimension
+    d_out = 8  # Output dimension (for GPT-2, d_in == d_out)
     num_heads = 2
-    head_dim = d_model // num_heads  # 4
+    head_dim = d_in // num_heads  # 4
 
     print("=" * 60)
     print("Generating Multi-Head Attention Test Case")
     print("=" * 60)
     print(f"Batch size: {batch_size}")
     print(f"Sequence length: {seq_len}")
-    print(f"d_model: {d_model}")
+    print(f"d_in: {d_in}")
+    print(f"d_out: {d_out}")
     print(f"num_heads: {num_heads}")
     print(f"head_dim: {head_dim}")
     print()
@@ -113,36 +116,38 @@ def generate_test_case():
     np.random.seed(42)
 
     # Initialize weights with simple patterns
-    W_q = np.zeros((d_model, d_model))
-    W_k = np.zeros((d_model, d_model))
-    W_v = np.zeros((d_model, d_model))
-    W_out = np.zeros((d_model, d_model))
+    # Q, K, V projections: (d_in, d_in)
+    W_q = np.zeros((d_in, d_in))
+    W_k = np.zeros((d_in, d_in))
+    W_v = np.zeros((d_in, d_in))
+    # Output projection: (d_out, d_in)
+    W_out = np.zeros((d_out, d_in))
 
     # W_query: pattern based on indices
-    for i in range(d_model):
-        for j in range(d_model):
-            W_q[i, j] = (i * d_model + j) * 0.01
+    for i in range(d_in):
+        for j in range(d_in):
+            W_q[i, j] = (i * d_in + j) * 0.01
 
     # W_key: slightly different pattern
-    for i in range(d_model):
-        for j in range(d_model):
-            W_k[i, j] = (i * d_model + j) * 0.01 + 0.1
+    for i in range(d_in):
+        for j in range(d_in):
+            W_k[i, j] = (i * d_in + j) * 0.01 + 0.1
 
     # W_value: another pattern
-    for i in range(d_model):
-        for j in range(d_model):
-            W_v[i, j] = (i * d_model + j) * 0.01 + 0.2
+    for i in range(d_in):
+        for j in range(d_in):
+            W_v[i, j] = (i * d_in + j) * 0.01 + 0.2
 
     # Output projection
-    for i in range(d_model):
-        for j in range(d_model):
-            W_out[i, j] = (i * d_model + j) * 0.01 + 0.3
+    for i in range(d_out):
+        for j in range(d_in):
+            W_out[i, j] = (i * d_in + j) * 0.01 + 0.3
 
-    # Create input with simple pattern
-    x = np.zeros((batch_size, seq_len, d_model))
+    # Create input with simple pattern: (batch, seq_len, d_in)
+    x = np.zeros((batch_size, seq_len, d_in))
     for b in range(batch_size):
         for s in range(seq_len):
-            for d in range(d_model):
+            for d in range(d_in):
                 x[b, s, d] = (b * 100 + s * 10 + d) * 0.1
 
     print("Input shape:", x.shape)
@@ -152,12 +157,16 @@ def generate_test_case():
     # Forward pass
     output, intermediates = multi_head_attention(x, W_q, W_k, W_v, W_out, num_heads)
 
+    # Verify output shape
+    assert output.shape == (batch_size, seq_len, d_out), f"Expected output shape {(batch_size, seq_len, d_out)}, got {output.shape}"
+
     # Save all data
     test_data = {
         'config': {
             'batch_size': batch_size,
             'seq_len': seq_len,
-            'd_model': d_model,
+            'd_in': d_in,
+            'd_out': d_out,
             'num_heads': num_heads,
             'head_dim': head_dim
         },
