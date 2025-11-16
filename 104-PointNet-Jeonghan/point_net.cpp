@@ -13,14 +13,14 @@ class TNetBlock : public NodeGroup
     uint32_t K;
 
     PointWiseMLPNode mlp[3];
-    MaxPoolingNode maxpool;
+    MaxPooling1DNode maxpool;
     FullyConnectedNode fc[3];
 
 public:
     TNetBlock(uint32_t inputDim)
     : K(inputDim),
     mlp{PointWiseMLPNode(K, 64), PointWiseMLPNode(64, 128), PointWiseMLPNode(128, 1024)},
-    maxpool(MaxPoolingNode()),
+    maxpool(MaxPooling1DNode()),
     fc{FullyConnectedNode(1024, 512), FullyConnectedNode(512, 256), FullyConnectedNode(256, K*K)}
     {
         mlp[0] - mlp[1] - mlp[2] - maxpool - fc[0] - fc[1] - fc[2];

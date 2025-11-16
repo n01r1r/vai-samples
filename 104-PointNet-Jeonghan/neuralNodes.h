@@ -49,6 +49,20 @@ public:
     void run(CommandBuffer cmdBuff) override;
 };
 
+class MaxPooling1DNode : public Node
+{
+
+    uint32_t C;
+
+    ComputePipeline maxpool;
+    DescriptorSet desc;
+
+public:
+    MaxPooling1DNode();
+    void prepare() override;
+    void run(CommandBuffer cmdBuff) override;
+};
+
 
 class MaxPoolingNode : public Node
 {

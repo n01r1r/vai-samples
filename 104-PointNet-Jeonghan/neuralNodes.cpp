@@ -100,6 +100,28 @@ void main()
     out0[(h_ * W_ + w_) * C + c] = maxVal;
 })";
 
+static const char* src_maxpool1d = R"(
+#version 450
+layout(local_size_x = 64) in;
+layout(set = 0, binding = 0) buffer OutBuffer { float out0[]; };
+layout(set = 0, binding = 1) buffer InBuffer { float in0[]; };
+layout(push_constant) uniform PC {
+    int N; // number of points
+    int C; // number of channels
+};
+
+void main() {
+    int c = int(gl_GlobalInvocationID.x);
+    if (c >= C) return;
+
+    float m = -3.4e38;
+    for (int n = 0; n < N; ++n) {
+        float v = in0[n * C + c];
+        m = max(m, v);
+    }
+    out0[c] = m;
+})";
+
 static const char* src_im2col = R"(
 #version 450
 layout(local_size_x = 64, local_size_y = 16) in;
@@ -763,7 +785,48 @@ void ReluNode::run(CommandBuffer cmdBuff)
 }  
 
 
+/////////////////////////////////////////////////////////////////////////////////////////
+// MaxPooling1DNode
+/////////////////////////////////////////////////////////////////////////////////////////
+MaxPooling1DNode::MaxPooling1DNode()
+{
+    addSlot("in0", NodeSlot::input);   // [N, C]
+    addSlot("out0", NodeSlot::output); // [C]
 
+    maxpool = requestPipeline(src_maxpool1d);
+    desc = maxpool.descSetLayout(0).newDescSet(gDestSetPool);}
+
+void MaxPooling1DNode::prepare()
+{
+    const auto& inShape = (*this)["in0"].shape();
+    _ASSERT(inShape.size() == 2);
+    uint32_t C = inShape[1];
+    (*this)["out0"] = Tensor(C);
+}
+
+void MaxPooling1DNode::run(CommandBuffer cmdBuff)
+{
+    const auto& inShape = (*this)["in0"].shape();
+    uint32_t N = inShape[0], C = inShape[1];
+
+    desc.write({
+        (*this)["out0"].buffer(),
+        (*this)["in0"].buffer(),
+    });
+
+    uint32_t pc[] = {N, C};
+
+    cmdBuff
+        .bindPipeline(maxpool)
+        .bindDescSets({desc})
+        .setPushConstants(0, sizeof(pc), pc)
+        .dispatch0(CEIL_DIV(C, 32))
+        .barrier(
+            (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_WRITE)
+            / (*this)["out0"].buffer()
+            / (PIPELINE_STAGE::COMPUTE_SHADER, ACCESS::SHADER_READ)
+        );
+}
 
 /////////////////////////////////////////////////////////////////////////////////////////
 // MaxPoolingNode
