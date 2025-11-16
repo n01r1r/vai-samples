@@ -2,6 +2,8 @@ void tokenizerTest();
 void dataLoaderTest();
 void embeddingNodeTest();
 void attentionNodeTest();
+void transformerNodeTest();
+void gpt2Test();
 
 int main()
 {
@@ -16,6 +18,12 @@ int main()
 
     // Run attention node tests (Multi-Head Attention)
     attentionNodeTest();
+
+    // Run transformer node tests (LayerNorm, GELU, FeedForward)
+    transformerNodeTest();
+
+    // Run GPT-2 model tests
+    gpt2Test();
 
     return 0;
 }

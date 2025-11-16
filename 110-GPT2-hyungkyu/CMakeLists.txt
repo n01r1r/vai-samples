@@ -17,6 +17,10 @@ add_executable(${PROJECT_NAME}
     model/embedding/embeddingNodeTest.cpp
     model/attention/attentionNode.cpp
     model/attention/attentionNodeTest.cpp
+    model/transformer/transformerNode.cpp
+    model/transformer/transformerNodeTest.cpp
+    model/gpt2.cpp
+    model/gpt2Test.cpp
 )
 
 add_definitions(

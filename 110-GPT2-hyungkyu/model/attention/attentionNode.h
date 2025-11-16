@@ -50,18 +50,19 @@ public:
 
 /**
  * Multi-Head Attention
- * Input: [batch, seq_len, d_model]
- * Output: [batch, seq_len, d_model]
+ * Input: [batch, seq_len, d_in]
+ * Output: [batch, seq_len, d_out]
  *
  * Internal weights:
- * - W_query: [d_model, d_model]
- * - W_key: [d_model, d_model]
- * - W_value: [d_model, d_model]
- * - W_out: [d_model, d_model]
+ * - W_query: [d_out, d_in] - project input to attention space
+ * - W_key: [d_out, d_in] - project input to attention space
+ * - W_value: [d_out, d_in] - project input to attention space
+ * - W_out: [d_out, d_out] - final transformation in output space
  */
 class MultiHeadAttentionNode : public Node
 {
-    uint32_t d_model;
+    uint32_t d_in;      // Input dimension
+    uint32_t d_out;     // Output dimension
     uint32_t num_heads;
     uint32_t head_dim;
 
@@ -85,8 +86,26 @@ class MultiHeadAttentionNode : public Node
     DescriptorSet combineDescSet;
     DescriptorSet outProjDescSet;
 
+    // Helper struct for intermediate tensors
+    struct IntermediateTensors {
+        Tensor Q_flat, K_flat, V_flat;
+        Tensor scores, attn_weights;
+        Tensor context, context_combined;
+    };
+
+    // Private helper functions for better readability
+    IntermediateTensors allocateIntermediateBuffers(uint32_t B, uint32_t S, uint32_t D, uint32_t H, uint32_t HD);
+    void computeQKVProjection(CommandBuffer& cmdBuff, const Tensor& input, IntermediateTensors& tensors,
+                              const Tensor& W_q, const Tensor& W_k, const Tensor& W_v, uint32_t B, uint32_t S, uint32_t D_in, uint32_t D_out);
+    void computeAttentionScores(CommandBuffer& cmdBuff, IntermediateTensors& tensors, uint32_t B, uint32_t H, uint32_t S, uint32_t HD);
+    void applyCausalMaskToScores(CommandBuffer& cmdBuff, IntermediateTensors& tensors, uint32_t B, uint32_t H, uint32_t S);
+    void computeSoftmax(CommandBuffer& cmdBuff, IntermediateTensors& tensors, uint32_t B, uint32_t H, uint32_t S);
+    void computeWeightedSum(CommandBuffer& cmdBuff, IntermediateTensors& tensors, uint32_t B, uint32_t H, uint32_t S, uint32_t HD);
+    void combineHeadsAndProject(CommandBuffer& cmdBuff, IntermediateTensors& tensors, const Tensor& W_out, Tensor& output,
+                                uint32_t B, uint32_t S, uint32_t D, uint32_t H, uint32_t HD);
+
 public:
-    MultiHeadAttentionNode(uint32_t d_model, uint32_t num_heads);
+    MultiHeadAttentionNode(uint32_t d_in, uint32_t d_out, uint32_t num_heads);
 
     void prepare() override;
     void run(CommandBuffer cmdBuff) override;
