@@ -75,7 +75,7 @@ endif()
 ################################################################################
 if (Vulkan_FOUND)
     message(STATUS "[SPIRV-Tools] Configuring SPIRV-Tools...")
-    set(SPIRV-Headers_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/spirv-headers")
+    set(SPIRV-Headers_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/SPIRV-Headers")
     set(mimalloc_SOURCE_DIR "${CMAKE_SOURCE_DIR}/external/mimalloc")
     add_subdirectory(external/SPIRV-Tools)
     message(STATUS "[SPIRV-Tools] SPIRV-Tools configuration completed.")
