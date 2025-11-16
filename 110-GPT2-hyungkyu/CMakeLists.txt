@@ -17,6 +17,8 @@ add_executable(${PROJECT_NAME}
     model/embedding/embeddingNodeTest.cpp
     model/attention/attentionNode.cpp
     model/attention/attentionNodeTest.cpp
+    model/transformer/transformerNode.cpp
+    model/transformer/transformerNodeTest.cpp
 )
 
 add_definitions(

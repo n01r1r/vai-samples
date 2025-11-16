@@ -2,6 +2,7 @@ void tokenizerTest();
 void dataLoaderTest();
 void embeddingNodeTest();
 void attentionNodeTest();
+void transformerNodeTest();
 
 int main()
 {
@@ -16,6 +17,9 @@ int main()
 
     // Run attention node tests (Multi-Head Attention)
     attentionNodeTest();
+
+    // Run transformer node tests (LayerNorm, GELU, FeedForward)
+    transformerNodeTest();
 
     return 0;
 }
